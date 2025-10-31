@@ -1,0 +1,306 @@
+import traceback
+import uvicorn
+from fastapi import FastAPI, File, UploadFile, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+import pandas as pd
+import numpy as np
+import re
+from sqlalchemy import create_engine, text
+import tempfile
+import os
+from datetime import datetime, timedelta
+
+# === INISIALISASI FASTAPI ===
+app = FastAPI()
+
+# === ALLOW CORS UNTUK IONIC ===
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# === KONFIGURASI DATABASE (GUNA SUPABASE DARI KOD PERTAMA) ===
+DB_CONN_STR = "postgresql://postgres:Ika_15050107@db.uonphwbbgemsvqzrdcwp.supabase.co:5432/postgres?sslmode=require"
+
+# === FUNGSI PEMBERSIH HEADER ===
+def clean_header(col):
+    col = str(col)
+    col = re.sub(r"\s+", "", col)
+    col = re.sub(r"&|/|\(|\)|\\n|RM", "", col, flags=re.IGNORECASE)
+    return col
+
+
+# === ENDPOINT UPLOAD ===
+@app.post("/upload")
+async def upload_csv(files: list[UploadFile] = File(...), preview: bool = Query(False)):
+    """
+    preview=True → hanya tapis & simpan CSV
+    preview=False → tapis + masukkan ke database
+    """
+    try:
+        dfs = []
+        for file in files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                tmp.write(await file.read())
+                tmp_path = tmp.name
+
+            temp = pd.read_csv(tmp_path, header=None, dtype=str, encoding='utf-8', skip_blank_lines=True)
+            row6 = temp.iloc[5].fillna("")
+            row7 = temp.iloc[6].fillna("")
+
+            combined_header = []
+            for h6, h7 in zip(row6, row7):
+                combined_header.append(str(h7).strip() or str(h6))
+
+            temp.columns = combined_header
+            temp = temp.iloc[7:].reset_index(drop=True)
+            dfs.append(temp)
+            os.remove(tmp_path)
+
+        # === GABUNG SEMUA CSV ===
+        df = pd.concat(dfs, ignore_index=True)
+        df.columns = [clean_header(c) for c in df.columns]
+
+        # Buang column tak perlu
+        drop_cols = ["Exit", "Class", "Exceptional"]
+        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+        # Susunan column akhir
+        final_cols = [
+            "TrxNo", "PlazaNo", "LaneNo", "EntryPlaza", "JobNo", "TransactionDateTime",
+            "Trx", "AVC", "PaymentMode", "FareAmount", "MfgNoTagID", "PaidAmount",
+            "Balance", "AccountType", "VehicleNo", "Code", "Remark", "PenaltyCode"
+        ]
+        final_cols = [c for c in final_cols if c in df.columns]
+        df = df[final_cols]
+
+        # === PEMBERSIH NILAI NUMERIC ===
+        money_cols = ["FareAmount", "PaidAmount", "Balance"]
+        for col in money_cols:
+            if col in df.columns:
+                df[col] = (
+                    df[col]
+                    .astype(str)
+                    .replace(r"[^\d.\-]", "", regex=True)
+                    .replace(r"^\s*$", np.nan, regex=True)
+                )
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        # === FORMAT SEMULA TARIKH ===
+        if "TransactionDateTime" in df.columns:
+            df["TransactionDateTime"] = (
+                df["TransactionDateTime"]
+                .astype(str)
+                .str.replace(r"\s*(AM|PM)", "", regex=True)
+                .str.strip()
+            )
+            df["TransactionDateTime"] = pd.to_datetime(
+                df["TransactionDateTime"],
+                dayfirst=True,
+                errors="coerce"
+            )
+            df["TransactionDateTime"] = df["TransactionDateTime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Bersih whitespace & nilai kosong
+        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        df.replace(
+            ["", " ", "NaN", "nan", "NULL", "null", "None", "N/A", "-", "--"],
+            np.nan,
+            inplace=True,
+        )
+
+        non_numeric_cols = [c for c in df.columns if c not in money_cols]
+        df[non_numeric_cols] = df[non_numeric_cols].fillna("NULL")
+
+        # === CONNECT DATABASE ===
+        engine = create_engine(DB_CONN_STR)
+
+        # === AMBIL DATA SEDIA ADA ===
+        try:
+            existing_df = pd.read_sql("SELECT * FROM public.sde22", engine)
+        except Exception:
+            existing_df = pd.DataFrame(columns=df.columns)
+
+        # === SAMAKAN STRUKTUR ===
+        for col in df.columns:
+            if col not in existing_df.columns:
+                existing_df[col] = np.nan
+        existing_df = existing_df[df.columns]
+
+        # === TUKAR SEMUA KE STRING ===
+        df = df.astype(str)
+        existing_df = existing_df.astype(str)
+
+        # === BUANG DUPLIKAT (PERBANDINGAN PENUH SATU BARIS) ===
+        merged_df = df.merge(
+            existing_df.drop_duplicates(),
+            on=list(df.columns),
+            how='left',
+            indicator=True
+        )
+        new_rows = merged_df[merged_df['_merge'] == 'left_only'].drop(columns=['_merge'])
+
+        # === SIMPAN CSV HASIL TAPIS ===
+        save_folder = r"C:\Users\awang\Compiler\filter"
+        os.makedirs(save_folder, exist_ok=True)
+        temp_csv_path = os.path.join(save_folder, "filtered_new_rows.csv")
+        new_rows.to_csv(temp_csv_path, index=False, encoding='utf-8-sig')
+        print(f"📁 Filtered CSV saved at: {temp_csv_path}")
+
+        print(f"💾 Existing rows: {len(existing_df)}")
+        print(f"🆕 New rows before filtering: {len(df)}")
+        print(f"✅ New unique rows to insert: {len(new_rows)}")
+
+        if new_rows.empty:
+            return {
+                "status": "success",
+                "rows": 0,
+                "message": "Semua data telah wujud, tiada data baru dimasukkan.",
+                "download": None
+            }
+
+        if preview:
+            return {
+                "status": "preview",
+                "rows": len(new_rows),
+                "message": f"{len(new_rows)} rekod baru ditemui (belum dimasukkan).",
+                "download": "/download-filtered"
+            }
+
+        # === MASUKKAN DATA BARU ===
+        new_rows.to_sql("sde22", engine, schema="public", if_exists="append", index=False)
+
+        # === DOUBLE CHECK: BUANG DUPLIKAT DALAM DATABASE ===
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TEMP TABLE temp_sde22 AS
+                SELECT DISTINCT * FROM public.sde22;
+            """))
+            conn.execute(text("TRUNCATE TABLE public.sde22;"))
+            conn.execute(text("""
+                INSERT INTO public.sde22
+                SELECT * FROM temp_sde22;
+            """))
+
+        return {
+            "status": "success",
+            "rows": len(new_rows),
+            "message": "Success",
+            "download": "/download-filtered"
+        }
+
+    except Exception as e:
+        import traceback
+        print("❌ ERROR:", traceback.format_exc())
+        return {"status": "error", "message": str(e)}
+
+
+# === ENDPOINT DOWNLOAD ===
+@app.get("/download-filtered")
+async def download_filtered():
+    save_folder = r"C:\Users\awang\Compiler\filter"
+    base_name = "filtered_new_rows"
+    ext = ".csv"
+    temp_csv_path = os.path.join(save_folder, base_name + ext)
+
+    if not os.path.exists(temp_csv_path):
+        return {"status": "error", "message": "Tiada fail hasil tapis ditemui."}
+
+    counter = 1
+    new_path = temp_csv_path
+    while os.path.exists(new_path):
+        new_path = os.path.join(save_folder, f"{base_name}_{counter}{ext}")
+        counter += 1
+
+    import shutil
+    shutil.copy(temp_csv_path, new_path)
+
+    return FileResponse(
+        new_path,
+        filename=os.path.basename(new_path),
+        media_type="text/csv"
+    )
+
+
+# === ENDPOINT UNTUK AMBIL DATA TNG ===
+@app.get("/tng-data")
+def get_tng_data(
+    start_date: str = None,
+    end_date: str = None,
+    filter_6am: bool = True,
+    plazas: str = Query(None, description="Senarai PlazaNo dipisah koma"),
+    limit: int = 100000,
+    offset: int = 0
+):
+    try:
+        engine = create_engine(DB_CONN_STR)
+
+        # Tetapkan tarikh default jika tidak diberi
+        if not start_date or not end_date:
+            now = datetime.now()
+            end_date = now.strftime("%Y-%m-%d")
+            start_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        # Tentukan julat datetime
+        if filter_6am:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d") + timedelta(hours=6)
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(hours=6)  # TIDAK tambah 1 hari
+        else:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+
+        # Query asas, PaymentMode = 'TNG'
+        query = """
+            SELECT
+                "TrxNo", "PlazaNo", "EntryPlaza", "LaneNo",
+                "TransactionDateTime", "PaidAmount", "MfgNoTagID",
+                "FareAmount", "VehicleNo", "PaymentMode",
+                "Balance", "Code", "PenaltyCode", "Remark", "AVC"
+            FROM public.sde22
+            WHERE "PaymentMode" = 'TNG'
+              AND "TransactionDateTime" >= :start
+              AND "TransactionDateTime" < :end
+        """
+        params = {"start": start_dt, "end": end_dt}
+
+        # Filter PlazaNo jika ada
+        if plazas:
+            plaza_list = [p.strip() for p in plazas.split(",") if p.strip()]
+            placeholders = ", ".join([f":p{i}" for i in range(len(plaza_list))])
+            for i, val in enumerate(plaza_list):
+                params[f"p{i}"] = val
+            query += f' AND "PlazaNo" IN ({placeholders})'
+
+        # Limit & offset
+        query += ' ORDER BY "TransactionDateTime" LIMIT :limit OFFSET :offset'
+        params.update({"limit": limit, "offset": offset})
+
+        # Ambil data
+        df = pd.read_sql(text(query), engine, params=params)
+
+        # === Statistik chart ===
+        chart_entry = df.groupby("EntryPlaza").size().reset_index(name="total").to_dict(orient="records") if not df.empty else []
+        chart_plaza = df.groupby("PlazaNo")["PaidAmount"].sum().reset_index().to_dict(orient="records") if not df.empty else []
+        chart_avc = df.groupby("AVC").size().reset_index(name="total").to_dict(orient="records") if "AVC" in df.columns and not df.empty else []
+
+        return {
+            "status": "success",
+            "count": len(df),
+            "data": df.to_dict(orient="records"),
+            "chart_entry": chart_entry,
+            "chart_plaza": chart_plaza,
+            "chart_avc": chart_avc
+        }
+
+    except Exception:
+        import traceback
+        print("❌ ERROR in /tng-data:\n", traceback.format_exc())
+        return {"status": "error", "message": "Ralat semasa ambil data."}
+
+# === JALANKAN SERVER ===
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
