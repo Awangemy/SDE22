@@ -435,6 +435,10 @@ def get_traffic_summary(
         print("❌ ERROR in /traffic-summary:\n", traceback.format_exc())
         return {"status": "error", "message": "Ralat semasa ambil traffic summary."}
 
+@app.get("/")
+def read_root():
+  return {"message": "Backend SDE22 is running successfully!"}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
