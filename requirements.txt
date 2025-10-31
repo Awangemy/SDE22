@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-python-dotenv
-supabase
-sqlalchemy
+pandas
+numpy
+SQLAlchemy
 psycopg2-binary
-
+python-multipart
+requests
