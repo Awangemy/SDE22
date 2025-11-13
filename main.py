@@ -313,6 +313,7 @@ def get_plaza_list():
 
 
 # === /wtng ENDPOINT ===
+# === /wtng ENDPOINT (gabung semua + filter 6AM hanya utk TNG) ===
 @app.get("/wtng")
 def get_wtng_data(
     start_date: str = None,
@@ -323,9 +324,12 @@ def get_wtng_data(
     offset: int = 0
 ):
     try:
-        start_dt, end_dt = parse_date_range(start_date, end_date, filter_6am=False)
+        # 1️⃣ Buat dua range masa
+        start_dt_normal, end_dt_normal = parse_date_range(start_date, end_date, filter_6am=False)
+        start_dt_tng, end_dt_tng = parse_date_range(start_date, end_date, filter_6am=True)
 
-        query = """
+        # 2️⃣ Query untuk data bukan TNG (masa biasa)
+        query_non_tng = """
             SELECT
                 "Trx", "TrxNo", "PlazaNo", "EntryPlaza", "LaneNo",
                 "TransactionDateTime", "PaidAmount", "MfgNoTagID",
@@ -333,30 +337,64 @@ def get_wtng_data(
                 "Balance", "Code", "PenaltyCode", "Remark", "AVC"
             FROM public.sde22
             WHERE "PaymentMode" != 'TNG'
-              AND "TransactionDateTime" >= :start
-              AND "TransactionDateTime" < :end
+              AND "TransactionDateTime" >= :start_normal
+              AND "TransactionDateTime" < :end_normal
         """
-        params = {"start": start_dt, "end": end_dt}
+
+        # 3️⃣ Query untuk data TNG (masa 6AM)
+        query_tng = """
+            SELECT
+                "Trx", "TrxNo", "PlazaNo", "EntryPlaza", "LaneNo",
+                "TransactionDateTime", "PaidAmount", "MfgNoTagID",
+                "FareAmount", "VehicleNo", "PaymentMode",
+                "Balance", "Code", "PenaltyCode", "Remark", "AVC"
+            FROM public.sde22
+            WHERE "PaymentMode" = 'TNG'
+              AND "TransactionDateTime" >= :start_tng
+              AND "TransactionDateTime" < :end_tng
+        """
+
+        # 4️⃣ Apply plaza & payment mode filter (optional)
+        plaza_clause = ""
+        payment_clause = ""
+        params = {
+            "start_normal": start_dt_normal,
+            "end_normal": end_dt_normal,
+            "start_tng": start_dt_tng,
+            "end_tng": end_dt_tng
+        }
 
         if plazas:
             plaza_list = [p.strip() for p in plazas.split(",") if p.strip()]
             placeholders = ", ".join([f":p{i}" for i in range(len(plaza_list))])
             for i, val in enumerate(plaza_list):
                 params[f"p{i}"] = val
-            query += f' AND "PlazaNo" IN ({placeholders})'
+            plaza_clause = f' AND "PlazaNo" IN ({placeholders})'
 
         if payment_modes:
             pm_list = [p.strip() for p in payment_modes.split(",") if p.strip()]
-            placeholders = ", ".join([f":pm{i}" for i in range(len(pm_list))])
+            placeholders_pm = ", ".join([f":pm{i}" for i in range(len(pm_list))])
             for i, val in enumerate(pm_list):
                 params[f"pm{i}"] = val
-            query += f' AND "PaymentMode" IN ({placeholders})'
+            payment_clause = f' AND "PaymentMode" IN ({placeholders_pm})'
 
-        query += ' ORDER BY "TransactionDateTime" LIMIT :limit OFFSET :offset'
+        # Tambah klausa filter (kalau ada)
+        query_non_tng += plaza_clause + payment_clause
+        query_tng += plaza_clause + payment_clause
+
+        # 5️⃣ Gabungkan hasil dua query
+        full_query = f"""
+            ({query_tng})
+            UNION ALL
+            ({query_non_tng})
+            ORDER BY "TransactionDateTime"
+            LIMIT :limit OFFSET :offset
+        """
         params.update({"limit": limit, "offset": offset})
 
-        df = pd.read_sql(text(query), engine, params=params)
+        df = pd.read_sql(text(full_query), engine, params=params)
 
+        # 6️⃣ Carta & output
         chart_entry = df.groupby("EntryPlaza").size().reset_index(name="total").to_dict(orient="records") if not df.empty else []
         chart_plaza = df.groupby("PlazaNo")["PaidAmount"].sum().reset_index().to_dict(orient="records") if not df.empty else []
         chart_avc = df.groupby("AVC").size().reset_index(name="total").to_dict(orient="records") if "AVC" in df.columns and not df.empty else []
@@ -373,7 +411,8 @@ def get_wtng_data(
     except Exception:
         import traceback
         print("❌ ERROR in /wtng:\n", traceback.format_exc())
-        return {"status": "error", "message": "Ralat semasa ambil data."}
+        return {"status": "error", "message": "Ralat semasa ambil data WTNG (gabungan)."}
+
 
 
 # === /traffic-summary ENDPOINT ===
